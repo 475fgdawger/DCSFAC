@@ -113,7 +113,11 @@ DWGR.MarkCAPRadiusNM        = 25       -- CAP station radius, NM
 DWGR.MarkSEADAltitude       = 20000
 DWGR.MarkBAIAltitude        = 12000
 DWGR.MarkStrikeAltitude     = 12000
-DWGR.MarkStrafeAltitude     = 5000
+DWGR.MarkStrafeAltitude     = 2000     -- kept low: the strafe loadout is rocket-heavy and
+                                       -- slant range costs accuracy (MOOSE default is 1000)
+DWGR.MarkStrafeLength       = 1000     -- m, length of the strafing target; lets the AI run the
+                                       -- attack along the target's axis instead of at a point.
+                                       -- Matched to MarkGroundRadius, the area actually scanned.
 DWGR.MarkCAPAltitude        = 20000
 DWGR.MarkCAPSpeed           = 350      -- kts
 DWGR.MarkCAPLegNM           = nil      -- nil = circular orbit; a number = racetrack leg
@@ -1054,7 +1058,9 @@ DWGR.MarkRequestTypes.STRAFE = function(coord)
   if not set or n == 0 then
     return nil, string.format("no enemy target within %d m", DWGR.MarkGroundRadius)
   end
-  return AUFTRAG:NewSTRAFING(set, DWGR.MarkStrafeAltitude),
+  -- NewSTRAFING authorises guns AND rockets (engageWeaponType 805337088), so a
+  -- rocket-heavy loadout is used as intended on this task.
+  return AUFTRAG:NewSTRAFING(set, DWGR.MarkStrafeAltitude, DWGR.MarkStrafeLength),
          string.format("%d target(s)", n)
 end
 
