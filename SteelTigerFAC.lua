@@ -155,6 +155,7 @@ DWGR.CallsignCounter = 0       -- rolling callsign group number for spawned flig
 DWGR.MarkIdCounter   = 90000   -- monotonic F10 marker id (random ids can collide and overwrite)
 DWGR.MarkIdBase      = 90000   -- marker ids at/above this are SCRIPT-created, never player marks
 DWGR.MarkMissionCount= 0       -- running counter for naming map-requested missions
+DWGR.HandledMarks    = {}      -- marker idx -> true once it has tasked a mission
 
 
 -- ---------------------------------------------------------------------------
@@ -947,8 +948,19 @@ end
 --   ordinary map note ("SEAD site?") is inert. Marks are additionally required
 --   to come from a FAC group (DWGR.MarkRequestFACOnly).
 --
+-- WHICH EVENT - THIS MATTERS:
+--   DCS creates the marker the instant the player CLICKS the map, before any
+--   text has been typed. S_EVENT_MARK_ADDED therefore fires with empty or
+--   placeholder text, and a keyword match against it always fails. The typed
+--   text only arrives with S_EVENT_MARK_CHANGE, when the player confirms the
+--   dialog - so CHANGE is the event that actually carries a FAC's request.
+--
+--   Both are handled anyway (MOOSE's own MARKEROPS_BASE does the same), since
+--   a mark can arrive with its text already set - e.g. one created by another
+--   script. DWGR.HandledMarks then keeps the pair from tasking twice.
+--
 -- FEEDBACK-LOOP HAZARD:
---   S_EVENT_MARK_ADDED fires for SCRIPT-created marks too, including the
+--   These events fire for SCRIPT-created marks too, including the
 --   trigger.action.markToAll in DWGR.HandleImpact. Ids at or above
 --   DWGR.MarkIdBase are ours and are skipped, so an impact marker can never
 --   task a mission that drops a marker that tasks a mission.
@@ -1104,9 +1116,10 @@ end
 
 
 -- ---------------------------------------------------------------------------
--- S_EVENT_MARK_ADDED handler: turn a keyword mark into an airwing mission.
+-- Mark handler: turn a keyword mark into an airwing mission. Fed by BOTH
+-- S_EVENT_MARK_ADDED and S_EVENT_MARK_CHANGE (see WHICH EVENT above).
 -- ---------------------------------------------------------------------------
-function DWGR.HandleMarkAdded(event)
+function DWGR.HandleMarkEvent(event)
   if not DWGR.MarkRequestEnabled then return end
   if not event.text or not event.pos then return end
 
@@ -1118,6 +1131,11 @@ function DWGR.HandleMarkAdded(event)
   local keyword = string.upper((string.gsub(event.text, "^%s*(.-)%s*$", "%1")))
   local build   = DWGR.MarkRequestTypes[keyword]
   if not build then return end   -- an ordinary map note: ignore silently
+
+  -- One mission per marker. ADDED and CHANGE can both carry the keyword, and
+  -- CHANGE fires again on every later edit of the same marker; without this a
+  -- FAC retyping a mark would stack duplicate missions on the wing.
+  if event.idx and DWGR.HandledMarks[event.idx] then return end
 
   -- Who placed it? initiator is nil for marks placed from a non-unit slot.
   local groupName
@@ -1176,6 +1194,13 @@ function DWGR.HandleMarkAdded(event)
   end
 
   DWGR.TFW8:AddMission(mission)
+
+  -- Recorded only once a mission is actually tasked. A DECLINED request stays
+  -- unrecorded on purpose, so a FAC who marked an empty field can retype the
+  -- same marker and try again rather than being locked out of that idx.
+  if event.idx then
+    DWGR.HandledMarks[event.idx] = true
+  end
 
   DWGR.Log(string.format("%s tasked from map mark by %s: %s (%s).",
       keyword, groupName or "unknown", mission:GetName(), tostring(detail)), 20)
@@ -1319,11 +1344,23 @@ function DWGR.RawShotHandler:onEvent(event)
 
   -- Map-mark mission requests. Same raw subscription as shots/takeoffs so the
   -- feature does not depend on MOOSE's event layer either.
-  if event.id == world.event.S_EVENT_MARK_ADDED then
-    local ok, err = pcall(DWGR.HandleMarkAdded, event)
+  --
+  -- CHANGE is the one that matters: the marker exists from the moment the map
+  -- is clicked, so ADDED carries no typed text yet. ADDED is still handled for
+  -- marks that arrive with their text already set.
+  if event.id == world.event.S_EVENT_MARK_ADDED
+      or event.id == world.event.S_EVENT_MARK_CHANGE then
+    local ok, err = pcall(DWGR.HandleMarkEvent, event)
     if not ok then
       env.error("DWGR: raw mark handler error (contained): " .. tostring(err))
     end
+    return
+  end
+
+  -- Marker deleted: drop its dedup entry so the table cannot grow without
+  -- bound over a long mission.
+  if event.id == world.event.S_EVENT_MARK_REMOVED then
+    if event.idx then DWGR.HandledMarks[event.idx] = nil end
     return
   end
 
@@ -1438,6 +1475,6 @@ DWGR.BuildOrbitPoints()
 -- earlier would leave a window where a takeoff/shot could call a nil.
 -- ---------------------------------------------------------------------------
 world.addEventHandler(DWGR.RawShotHandler)
-env.info("DWGR: raw DCS event handler registered for S_EVENT_SHOT + S_EVENT_TAKEOFF + S_EVENT_MARK_ADDED (bypasses MOOSE EVENTHANDLER).")
+env.info("DWGR: raw DCS event handler registered for S_EVENT_SHOT + S_EVENT_TAKEOFF + S_EVENT_MARK_ADDED/CHANGE/REMOVED (bypasses MOOSE EVENTHANDLER).")
 
 DWGR.Log("SteelTiger FAC CAS-stack script loaded.", 20)
