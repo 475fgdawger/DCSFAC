@@ -587,6 +587,34 @@ function DWGR.NextSmokeColor()
 end
 
 
+-- Clamp a Vec3 onto the terrain surface at its own x/z.
+--
+-- The tracked M156's "impact point" is the LAST POLLED position before the
+-- weapon object stopped existing, so it is up to DWGR.TrackInterval seconds of
+-- flight ABOVE the ground - a rocket in a steep terminal dive can be tens of
+-- metres up at that sample. Smoke issued at that raw Vec3 hangs in mid-air over
+-- the target instead of marking it. Re-deriving y from land.getHeight pins the
+-- plume to the ground.
+--
+-- land.getHeight takes a Vec2 whose .y is the WORLD Z axis (DCS names the
+-- horizontal pair x/y in 2D but x/z in 3D). Guarded: a land query on an invalid
+-- coordinate must not throw inside the impact path.
+function DWGR.ClampToGround(pos)
+  if not pos then return nil end
+
+  local ok, height = pcall(function()
+    return land.getHeight({ x = pos.x, y = pos.z })
+  end)
+
+  if not ok or not height then
+    env.error("DWGR: land.getHeight failed; smoking at raw weapon position.")
+    return pos
+  end
+
+  return { x = pos.x, y = height, z = pos.z }
+end
+
+
 -- Begin sustaining smoke at pos. Returns a smokeId used to stop it later.
 function DWGR.StartSustainedSmoke(pos, color)
   DWGR.SmokeIdCounter = DWGR.SmokeIdCounter + 1
@@ -808,8 +836,13 @@ function DWGR.HandleImpact(pos)
   if DWGR.SmokeImpact then
     local color
     color, colorName = DWGR.NextSmokeColor()
-    smokeId = DWGR.StartSustainedSmoke(pos, color)
-    env.info(string.format("DWGR: impact smoked %s (id %d).", colorName, smokeId))
+    -- Smoke the GROUND under the last known position, not the position itself:
+    -- the plume must sit on the target, not hang at the rocket's last sampled
+    -- altitude. Every refresh puff reuses this same clamped Vec3.
+    local smokePos = DWGR.ClampToGround(pos)
+    smokeId = DWGR.StartSustainedSmoke(smokePos, color)
+    env.info(string.format("DWGR: impact smoked %s (id %d) at ground level %.1fm (weapon last seen %.1fm).",
+        colorName, smokeId, smokePos.y, pos.y))
   end
 
   -- RESERVE the marker id up front so it can be handed to the CAS mission (which
