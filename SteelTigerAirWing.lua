@@ -1,6 +1,6 @@
 MESSAGE:New("AIRWING START",10):ToAll()
 DWGR = {}
-DWGR.FS433=SQUADRON:New("F-4E Group", 48, "433rd FS (POSSUM)")
+DWGR.FS433=SQUADRON:New("F-4E Group", 48, "POSSUM ")
 DWGR.FS433:SetGrouping(2)
 --DWGR.FS433:SetCallsign(CALLSIGN.TEAM.Possum, 1)
 DWGR.FS433:SetRadio(233)                       -- Squadon communicates on 233 MHz AM.
