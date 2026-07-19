@@ -95,6 +95,29 @@ DWGR.SmokeColorNames = { "Green", "Red", "White", "Orange", "Blue" }
 DWGR.SmokeLifetime          = 300      -- s a DCS smoke plume lasts (engine constant)
 DWGR.SmokeRefresh           = 290      -- s between re-issues; must be < SmokeLifetime
 
+-- --- F10 map-mark mission requests -----------------------------------------
+-- A FAC drops an F10 marker whose text is EXACTLY one of the supported
+-- keywords and the airwing is tasked at that point. See the MAP-MARK MISSION
+-- REQUESTS section below for the keyword list and the safety filters.
+DWGR.MarkRequestEnabled     = true
+DWGR.MarkRequestFACOnly     = true     -- only marks from a FAC-named group task missions
+DWGR.EnemyCoalition         = coalition.side.RED
+
+-- Search radii, metres; the mark is the centre of the search.
+DWGR.MarkSEADRadius         = 3704     -- 12152.23 ft - emitter search for SEAD
+DWGR.MarkGroundRadius       = 1000     -- CAS / BAI / STRAFE target search
+DWGR.MarkCAPRadiusNM        = 25       -- CAP station radius, NM
+
+-- Working altitudes, ft. CAS deliberately reuses DWGR.CASAltitude so a
+-- map-requested CAS flies the same profile as an M156-triggered one.
+DWGR.MarkSEADAltitude       = 20000
+DWGR.MarkBAIAltitude        = 12000
+DWGR.MarkStrikeAltitude     = 12000
+DWGR.MarkStrafeAltitude     = 5000
+DWGR.MarkCAPAltitude        = 20000
+DWGR.MarkCAPSpeed           = 350      -- kts
+DWGR.MarkCAPLegNM           = nil      -- nil = circular orbit; a number = racetrack leg
+
 -- --- Callsigns -------------------------------------------------------------
 DWGR.CallsignName           = CALLSIGN.Aircraft.Ford -- callsign family for spawned flights
 
@@ -126,6 +149,8 @@ DWGR.CASCount        = 0       -- running CAS mission counter for naming
 DWGR.FuelWatchSet    = {}      -- flightgroup name -> true, so we only add the fuel watch once per group
 DWGR.CallsignCounter = 0       -- rolling callsign group number for spawned flights
 DWGR.MarkIdCounter   = 90000   -- monotonic F10 marker id (random ids can collide and overwrite)
+DWGR.MarkIdBase      = 90000   -- marker ids at/above this are SCRIPT-created, never player marks
+DWGR.MarkMissionCount= 0       -- running counter for naming map-requested missions
 
 
 -- ---------------------------------------------------------------------------
@@ -900,6 +925,257 @@ function DWGR.HandleImpact(pos)
 end
 
 
+-- ===========================================================================
+-- MAP-MARK MISSION REQUESTS
+--
+-- A FAC types a BARE KEYWORD into an F10 map marker and the airwing is tasked
+-- at that point:
+--
+--   SEAD    scan MarkSEADRadius for SEADable emitters, task SEAD on them
+--   STRIKE  task STRIKE at the mark; MOOSE attacks the nearest MAP OBJECT
+--   STRAFE  scan MarkGroundRadius for enemy units/statics, task STRAFING
+--   CAS     CASENHANCED over a MarkGroundRadius zone centred on the mark
+--   BAI     scan MarkGroundRadius for enemy units/statics, task BAI
+--   CAP     CAP station of MarkCAPRadiusNM centred on the mark
+--
+-- WHY BARE KEYWORDS ARE SAFE:
+--   The text must equal a keyword EXACTLY once trimmed and upper-cased, so an
+--   ordinary map note ("SEAD site?") is inert. Marks are additionally required
+--   to come from a FAC group (DWGR.MarkRequestFACOnly).
+--
+-- FEEDBACK-LOOP HAZARD:
+--   S_EVENT_MARK_ADDED fires for SCRIPT-created marks too, including the
+--   trigger.action.markToAll in DWGR.HandleImpact. Ids at or above
+--   DWGR.MarkIdBase are ours and are skipped, so an impact marker can never
+--   task a mission that drops a marker that tasks a mission.
+-- ===========================================================================
+
+
+-- ---------------------------------------------------------------------------
+-- Collect enemy units and statics within Radius of Coord, as a SET_UNIT.
+--
+-- Deliberately NOT ZONE_RADIUS:GetScannedSetUnit(): that helper applies its
+-- coalition filter to UNITS only, then falls back to adding any STATIC it finds
+-- REGARDLESS of side - which would let a CAS request task friendly buildings.
+-- We walk the raw scan results and filter coalition ourselves.
+--
+-- Filter (optional): function(wrapped) -> boolean, applied to the MOOSE wrapper.
+-- Returns (SET_UNIT, count) or (nil, 0) if the scan threw.
+-- ---------------------------------------------------------------------------
+function DWGR.ScanEnemyTargets(Coord, Radius, Filter, Label)
+  local set   = SET_UNIT:New()
+  local count = 0
+
+  local ok, err = pcall(function()
+    local zone = ZONE_RADIUS:New("DWGR_Scan_" .. tostring(timer.getTime()),
+        Coord:GetVec2(), Radius)
+
+    zone:Scan({ Object.Category.UNIT, Object.Category.STATIC },
+              { Unit.Category.GROUND_UNIT, Unit.Category.SHIP })
+
+    for _, object in pairs(zone:GetScannedUnits() or {}) do
+      if object:isExist() and object:getCoalition() == DWGR.EnemyCoalition then
+        local name    = object:getName()
+        local wrapped = UNIT:FindByName(name) or STATIC:FindByName(name, false)
+        if wrapped and (not Filter or Filter(wrapped)) then
+          set:AddUnit(wrapped)
+          count = count + 1
+        end
+      end
+    end
+  end)
+
+  if not ok then
+    env.error(string.format("DWGR: %s target scan failed: %s", tostring(Label), tostring(err)))
+    return nil, 0
+  end
+
+  return set, count
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Does the airwing hold a payload that can fly this mission type?
+--
+-- The SQUADRON's AddMissionCapability list is NOT sufficient: a squadron can be
+-- declared capable of SEAD while no registered payload offers SEAD, in which
+-- case AddMission succeeds and the mission then sits unrecruited forever. This
+-- read-only check over the wing's payload table lets us refuse the request out
+-- loud instead. Read-only on purpose - FetchPayloadFromStock would reserve one.
+-- ---------------------------------------------------------------------------
+function DWGR.WingHasPayloadFor(MissionType)
+  local found = false
+  local ok = pcall(function()
+    for _, payload in pairs(DWGR.TFW8.payloads or {}) do
+      if AUFTRAG.CheckMissionCapability(MissionType, payload.capabilities) then
+        found = true
+        return
+      end
+    end
+  end)
+  -- On error, assume it is available: a broken check must not ground the wing.
+  if not ok then return true end
+  return found
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Keyword -> builder. Each builder takes the mark COORDINATE and returns
+-- (AUFTRAG, detail) on success, or (nil, reason) to decline the request.
+-- Add a keyword here and it is live; nothing else needs touching.
+-- ---------------------------------------------------------------------------
+DWGR.MarkRequestTypes = {}
+
+DWGR.MarkRequestTypes.SEAD = function(coord)
+  local set, n = DWGR.ScanEnemyTargets(coord, DWGR.MarkSEADRadius,
+      function(u) return u.HasSEAD and u:HasSEAD() end, "SEAD")
+
+  if not set or n == 0 then
+    return nil, string.format("no SEADable emitter within %.1f km",
+        DWGR.MarkSEADRadius / 1000)
+  end
+
+  -- NOTE: AUFTRAG:NewSEADInZone() is NOT used. In this MOOSE build its
+  -- _TargetFromObject call is commented out, so the mission carries no
+  -- engageTarget and GetTargetCoordinate() returns nil - which breaks airwing
+  -- recruiting and routing. Handing NewSEAD a real target set avoids that.
+  return AUFTRAG:NewSEAD(set, DWGR.MarkSEADAltitude),
+         string.format("%d emitter(s)", n)
+end
+
+DWGR.MarkRequestTypes.STRIKE = function(coord)
+  -- NewSTRIKE with a COORDINATE already attacks the closest MAP OBJECT to that
+  -- point, which is the requested behaviour - so no scan is performed here.
+  return AUFTRAG:NewSTRIKE(coord, DWGR.MarkStrikeAltitude), "nearest map object"
+end
+
+DWGR.MarkRequestTypes.STRAFE = function(coord)
+  local set, n = DWGR.ScanEnemyTargets(coord, DWGR.MarkGroundRadius, nil, "STRAFE")
+  if not set or n == 0 then
+    return nil, string.format("no enemy target within %d m", DWGR.MarkGroundRadius)
+  end
+  return AUFTRAG:NewSTRAFING(set, DWGR.MarkStrafeAltitude),
+         string.format("%d target(s)", n)
+end
+
+DWGR.MarkRequestTypes.BAI = function(coord)
+  local set, n = DWGR.ScanEnemyTargets(coord, DWGR.MarkGroundRadius, nil, "BAI")
+  if not set or n == 0 then
+    return nil, string.format("no enemy target within %d m", DWGR.MarkGroundRadius)
+  end
+  return AUFTRAG:NewBAI(set, DWGR.MarkBAIAltitude),
+         string.format("%d target(s)", n)
+end
+
+DWGR.MarkRequestTypes.CAS = function(coord)
+  -- CASENHANCED takes a ZONE and finds its own targets inside it, so the scan
+  -- here is only a sanity check: refuse rather than send a flight to an empty
+  -- patch of ground.
+  local _, n = DWGR.ScanEnemyTargets(coord, DWGR.MarkGroundRadius, nil, "CAS")
+  if n == 0 then
+    return nil, string.format("no enemy target within %d m", DWGR.MarkGroundRadius)
+  end
+
+  local zone = ZONE_RADIUS:New("MarkCAS_" .. tostring(timer.getTime()),
+      coord:GetVec2(), DWGR.MarkGroundRadius)
+
+  local mission = AUFTRAG:NewCASENHANCED(zone, DWGR.CASAltitude)
+  if mission.SetWeaponExpend then
+    mission:SetWeaponExpend(AI.Task.WeaponExpend.ALL)
+  end
+  return mission, string.format("%d target(s)", n)
+end
+
+DWGR.MarkRequestTypes.CAP = function(coord)
+  -- No scan: a CAP station is defined by geometry, not by what is on the ground.
+  local zone = ZONE_RADIUS:New("MarkCAP_" .. tostring(timer.getTime()),
+      coord:GetVec2(), UTILS.NMToMeters(DWGR.MarkCAPRadiusNM))
+
+  return AUFTRAG:NewCAP(zone, DWGR.MarkCAPAltitude, DWGR.MarkCAPSpeed,
+             coord, nil, DWGR.MarkCAPLegNM),
+         string.format("%d NM station", DWGR.MarkCAPRadiusNM)
+end
+
+
+-- ---------------------------------------------------------------------------
+-- S_EVENT_MARK_ADDED handler: turn a keyword mark into an airwing mission.
+-- ---------------------------------------------------------------------------
+function DWGR.HandleMarkAdded(event)
+  if not DWGR.MarkRequestEnabled then return end
+  if not event.text or not event.pos then return end
+
+  -- Skip our own markers (see FEEDBACK-LOOP HAZARD above).
+  if event.idx and event.idx >= DWGR.MarkIdBase then return end
+
+  -- Bare keyword: trim, upper-case, and require an exact match. The extra
+  -- parentheses drop gsub's second return value.
+  local keyword = string.upper((string.gsub(event.text, "^%s*(.-)%s*$", "%1")))
+  local build   = DWGR.MarkRequestTypes[keyword]
+  if not build then return end   -- an ordinary map note: ignore silently
+
+  -- Who placed it? initiator is nil for marks placed from a non-unit slot.
+  local groupName
+  if event.initiator then
+    pcall(function()
+      local grp = event.initiator:getGroup()
+      if grp then groupName = grp:getName() end
+    end)
+  end
+
+  if DWGR.MarkRequestFACOnly then
+    if not groupName or not string.find(groupName, DWGR.FACNamePattern) then
+      DWGR.Log(string.format("%s mark ignored - not placed by a '%s' group.",
+          keyword, DWGR.FACNamePattern), 10)
+      return
+    end
+  end
+
+  local coord = COORDINATE:NewFromVec3(event.pos)
+
+  local mission, detail = build(coord)
+  if not mission then
+    DWGR.Log(string.format("%s request declined - %s.", keyword, tostring(detail)), 20)
+    return
+  end
+
+  -- Refuse loudly if no payload can fly it, rather than queueing a mission the
+  -- wing will never recruit for.
+  if not DWGR.WingHasPayloadFor(mission:GetType()) then
+    DWGR.Log(string.format(
+        "%s request declined - no %s payload registered at the airwing.",
+        keyword, mission:GetType()), 25)
+    return
+  end
+
+  DWGR.MarkMissionCount = DWGR.MarkMissionCount + 1
+  mission:SetName(string.format("FAC %s %d", keyword, DWGR.MarkMissionCount))
+
+  -- Send the flight home when the mission resolves, matching the CAS path.
+  local function release(reason)
+    local grps = mission:GetOpsGroups()
+    if grps then
+      for _, fg in pairs(grps) do
+        DWGR.SendHome(fg, reason)
+      end
+    end
+  end
+
+  function mission:OnAfterSuccess(From, Event, To)
+    DWGR.Log(mission:GetName() .. " success.", 20)
+    release(keyword .. " complete")
+  end
+
+  function mission:OnAfterDone(From, Event, To)
+    release(keyword .. " done")
+  end
+
+  DWGR.TFW8:AddMission(mission)
+
+  DWGR.Log(string.format("%s tasked from map mark by %s: %s (%s).",
+      keyword, groupName or "unknown", mission:GetName(), tostring(detail)), 20)
+end
+
+
 -- Start tracking a raw DCS weapon object to its impact point.
 -- Polls position every DWGR.TrackInterval seconds; when the weapon no longer
 -- exists, the last good position is the impact point.
@@ -1035,6 +1311,16 @@ function DWGR.RawShotHandler:onEvent(event)
     return
   end
 
+  -- Map-mark mission requests. Same raw subscription as shots/takeoffs so the
+  -- feature does not depend on MOOSE's event layer either.
+  if event.id == world.event.S_EVENT_MARK_ADDED then
+    local ok, err = pcall(DWGR.HandleMarkAdded, event)
+    if not ok then
+      env.error("DWGR: raw mark handler error (contained): " .. tostring(err))
+    end
+    return
+  end
+
   -- Everything past here is shots only.
   if event.id ~= world.event.S_EVENT_SHOT then
     return
@@ -1146,6 +1432,6 @@ DWGR.BuildOrbitPoints()
 -- earlier would leave a window where a takeoff/shot could call a nil.
 -- ---------------------------------------------------------------------------
 world.addEventHandler(DWGR.RawShotHandler)
-env.info("DWGR: raw DCS event handler registered for S_EVENT_SHOT + S_EVENT_TAKEOFF (bypasses MOOSE EVENTHANDLER).")
+env.info("DWGR: raw DCS event handler registered for S_EVENT_SHOT + S_EVENT_TAKEOFF + S_EVENT_MARK_ADDED (bypasses MOOSE EVENTHANDLER).")
 
 DWGR.Log("SteelTiger FAC CAS-stack script loaded.", 20)
