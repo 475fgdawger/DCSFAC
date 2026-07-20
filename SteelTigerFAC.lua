@@ -104,6 +104,8 @@ DWGR.MarkDebug              = true     -- log WHY a mark was rejected (log only,
 DWGR.MarkDumpEvents         = false    -- dump the raw mark event table; see DWGR.DumpMarkEvent
 DWGR.MarkRemoveOnComplete   = true     -- delete the requesting marker when its mission ends,
                                        -- so the F10 map shows only OUTSTANDING requests
+DWGR.MarkAcknowledge        = true     -- on tasking, replace "SEAD" with "SEAD Mission Tasked"
+DWGR.MarkAckSuffix          = " Mission Tasked"
 
 -- WHO MAY TASK A MISSION FROM THE MAP.
 --
@@ -1336,6 +1338,10 @@ function DWGR.HandleMarkEvent(event)
   -- Capture the idx rather than the event: this closure outlives the handler by
   -- the whole length of the mission, and there is no reason to pin the event
   -- table (and its DCS object references) open for that long.
+  --
+  -- REASSIGNED below if the marker is replaced by an acknowledgement, so that
+  -- completion removes the acknowledgement rather than an id that is already
+  -- gone. release() reads it as an upvalue, so it sees the updated value.
   local markIdx  = event.idx
   local released = false
 
@@ -1376,10 +1382,38 @@ function DWGR.HandleMarkEvent(event)
 
   DWGR.TFW8:AddMission(mission)
 
-  -- Recorded only once a mission is actually tasked. A DECLINED request stays
+  -- Acknowledge on the map: "SEAD" becomes "SEAD Mission Tasked", so the FAC
+  -- can see the request was accepted without reading the log.
+  --
+  -- DCS has NO API to edit a mark's text, so this is a remove-and-redraw. The
+  -- replacement is a SCRIPT marker and must be registered in DWGR.OwnMarks
+  -- BEFORE it is drawn: markToAll fires S_EVENT_MARK_ADDED straight back into
+  -- this handler, and the registry is what stops it being treated as a fresh
+  -- request. (The acknowledged text would not match a bare keyword anyway, but
+  -- relying on that would make the safety depend on the wording.)
+  local acknowledged = false
+  if DWGR.MarkAcknowledge and event.idx and event.pos then
+    pcall(function()
+      DWGR.RemoveMark(event.idx)
+      DWGR.HandledMarks[event.idx] = nil   -- the original id no longer exists
+
+      DWGR.MarkIdCounter = (DWGR.MarkIdCounter or DWGR.MarkIdBase) + 1
+      local ackId = DWGR.MarkIdCounter
+      DWGR.OwnMarks[ackId] = true
+
+      -- readOnly = true: the acknowledgement is script-owned and is cleared
+      -- when the mission ends, so players cannot delete it out from under us.
+      trigger.action.markToAll(ackId, keyword .. DWGR.MarkAckSuffix, event.pos, true)
+
+      markIdx      = ackId   -- completion now clears the acknowledgement
+      acknowledged = true
+    end)
+  end
+
+  -- Only needed when the original marker still exists. A DECLINED request stays
   -- unrecorded on purpose, so a FAC who marked an empty field can retype the
   -- same marker and try again rather than being locked out of that idx.
-  if event.idx then
+  if not acknowledged and event.idx then
     DWGR.HandledMarks[event.idx] = true
   end
 
