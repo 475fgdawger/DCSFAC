@@ -1124,6 +1124,47 @@ end
 
 
 -- ---------------------------------------------------------------------------
+-- Dump every field a mark event actually carries.
+--
+-- DCS's documented shape for these events does not match what it delivers in
+-- practice, and which of initiator / groupID / coalition is populated varies.
+-- Rather than keep guessing, this prints the real table so the placer filter
+-- can be written against observed behaviour.
+-- ---------------------------------------------------------------------------
+function DWGR.DumpMarkEvent(event)
+  if not DWGR.MarkDebug then return end
+
+  local parts = {}
+  pcall(function()
+    for k, v in pairs(event) do
+      table.insert(parts, string.format("%s=%s(%s)", tostring(k), tostring(v), type(v)))
+    end
+  end)
+  env.info("DWGR: mark event fields: " .. table.concat(parts, " "))
+
+  -- Probe the initiator specifically: it may exist but not be a unit, or be a
+  -- unit whose group cannot be read.
+  if event.initiator then
+    pcall(function()
+      local ini = event.initiator
+      local name, grpName, player, cat
+      pcall(function() name    = ini.getName    and ini:getName() end)
+      pcall(function() player  = ini.getPlayerName and ini:getPlayerName() end)
+      pcall(function() cat     = ini.getCategory and ini:getCategory() end)
+      pcall(function()
+        local g = ini.getGroup and ini:getGroup()
+        if g then grpName = g:getName() end
+      end)
+      env.info(string.format("DWGR: mark initiator unit=%s group=%s player=%s category=%s",
+          tostring(name), tostring(grpName), tostring(player), tostring(cat)))
+    end)
+  else
+    env.info("DWGR: mark initiator is nil.")
+  end
+end
+
+
+-- ---------------------------------------------------------------------------
 -- Mark handler: turn a keyword mark into an airwing mission. Fed by BOTH
 -- S_EVENT_MARK_ADDED and S_EVENT_MARK_CHANGE (see WHICH EVENT above).
 -- ---------------------------------------------------------------------------
@@ -1172,6 +1213,9 @@ function DWGR.HandleMarkEvent(event)
     return reject("marker already tasked a mission")
   end
 
+  -- A real request from here on, so dump what DCS actually gave us.
+  DWGR.DumpMarkEvent(event)
+
   -- Who placed it? DCS is inconsistent here: mark events sometimes carry an
   -- initiator unit and sometimes only a groupID, so try the cheap path first
   -- and fall back to resolving the id. Either can legitimately be absent (a
@@ -1179,12 +1223,14 @@ function DWGR.HandleMarkEvent(event)
   local groupName
   if event.initiator then
     pcall(function()
-      local grp = event.initiator:getGroup()
+      local grp = event.initiator.getGroup and event.initiator:getGroup()
       if grp then groupName = grp:getName() end
     end)
   end
 
-  if not groupName and event.groupID then
+  -- groupID fallback. DCS uses -1 for "not a specific group" (e.g. a mark on
+  -- the coalition-wide channel), so only a positive id is worth resolving.
+  if not groupName and event.groupID and event.groupID > 0 then
     pcall(function()
       for _, side in pairs({ coalition.side.BLUE, coalition.side.RED }) do
         for _, grp in pairs(coalition.getGroups(side) or {}) do
@@ -1195,11 +1241,24 @@ function DWGR.HandleMarkEvent(event)
         end
       end
     end)
+    if not groupName and DWGR.MarkDebug then
+      env.info(string.format("DWGR: groupID %s matched no live group.",
+          tostring(event.groupID)))
+    end
+  end
+
+  -- Coalition gate, applied whether or not the FAC filter is on: without it,
+  -- turning MarkRequestFACOnly off would let a RED player's mark task the BLUE
+  -- airwing. Only enforced when DCS actually told us the coalition.
+  if event.coalition and event.coalition ~= coalition.side.BLUE then
+    return reject("mark is not on the blue coalition channel")
   end
 
   if DWGR.MarkRequestFACOnly then
     if not groupName or not string.find(groupName, DWGR.FACNamePattern) then
-      DWGR.Log(string.format("%s mark ignored - placed by '%s', not a '%s' group.",
+      DWGR.Log(string.format(
+          "%s mark ignored - placed by '%s', not a '%s' group. "
+          .. "(Set DWGR.MarkRequestFACOnly=false to allow any blue player.)",
           keyword, groupName or "unknown", DWGR.FACNamePattern), 10)
       return
     end
