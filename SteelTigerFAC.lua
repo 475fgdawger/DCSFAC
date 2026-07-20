@@ -101,6 +101,7 @@ DWGR.SmokeRefresh           = 290      -- s between re-issues; must be < SmokeLi
 -- REQUESTS section below for the keyword list and the safety filters.
 DWGR.MarkRequestEnabled     = true
 DWGR.MarkRequestFACOnly     = true     -- only marks from a FAC-named group task missions
+DWGR.MarkDebug              = true     -- log WHY a mark was rejected (log only, no on-screen spam)
 DWGR.EnemyCoalition         = coalition.side.RED
 
 -- Search radii, metres; the mark is the centre of the search.
@@ -153,7 +154,8 @@ DWGR.CASCount        = 0       -- running CAS mission counter for naming
 DWGR.FuelWatchSet    = {}      -- flightgroup name -> true, so we only add the fuel watch once per group
 DWGR.CallsignCounter = 0       -- rolling callsign group number for spawned flights
 DWGR.MarkIdCounter   = 90000   -- monotonic F10 marker id (random ids can collide and overwrite)
-DWGR.MarkIdBase      = 90000   -- marker ids at/above this are SCRIPT-created, never player marks
+DWGR.MarkIdBase      = 90000   -- start of our marker id range (see DWGR.OwnMarks for ownership)
+DWGR.OwnMarks        = {}      -- marker idx -> true for every marker THIS SCRIPT created
 DWGR.MarkMissionCount= 0       -- running counter for naming map-requested missions
 DWGR.HandledMarks    = {}      -- marker idx -> true once it has tasked a mission
 
@@ -880,8 +882,11 @@ function DWGR.HandleImpact(pos)
   -- needs the mission name, which does not exist until AssignCAS has run.
   local markId = nil
   if DWGR.MarkImpact then
-    DWGR.MarkIdCounter = (DWGR.MarkIdCounter or 90000) + 1
+    DWGR.MarkIdCounter = (DWGR.MarkIdCounter or DWGR.MarkIdBase) + 1
     markId = DWGR.MarkIdCounter
+    -- Registered at RESERVATION time, not when drawn: the mark event must never
+    -- be able to fire before we know the id is ours.
+    DWGR.OwnMarks[markId] = true
   end
 
   local zoneName = "FAC_Zone_" .. tostring(timer.getTime())
@@ -961,9 +966,12 @@ end
 --
 -- FEEDBACK-LOOP HAZARD:
 --   These events fire for SCRIPT-created marks too, including the
---   trigger.action.markToAll in DWGR.HandleImpact. Ids at or above
---   DWGR.MarkIdBase are ours and are skipped, so an impact marker can never
---   task a mission that drops a marker that tasks a mission.
+--   trigger.action.markToAll in DWGR.HandleImpact. Every id this script
+--   creates is registered in DWGR.OwnMarks and skipped on the way in, so an
+--   impact marker can never task a mission that drops a marker that tasks a
+--   mission. Ownership must be tracked explicitly rather than inferred from an
+--   id range: DCS's marker-id counter is global and monotonic across all marks,
+--   so our own 90001 pushes subsequent PLAYER marks above 90000 as well.
 -- ===========================================================================
 
 
@@ -1120,24 +1128,54 @@ end
 -- S_EVENT_MARK_ADDED and S_EVENT_MARK_CHANGE (see WHICH EVENT above).
 -- ---------------------------------------------------------------------------
 function DWGR.HandleMarkEvent(event)
-  if not DWGR.MarkRequestEnabled then return end
-  if not event.text or not event.pos then return end
+  -- Every rejection below reports itself. These paths are all silent to the
+  -- pilot by design (an ordinary map note must not spam the wing), but a
+  -- request that vanishes with no trace anywhere is undiagnosable - which is
+  -- exactly how the id-range bug below hid.
+  local function reject(reason)
+    if DWGR.MarkDebug then
+      env.info(string.format("DWGR: mark idx=%s rejected - %s (text=%q)",
+          tostring(event.idx), reason, tostring(event.text)))
+    end
+  end
+
+  if not DWGR.MarkRequestEnabled then return reject("MarkRequestEnabled is false") end
+
+  -- No text on S_EVENT_MARK_ADDED is NORMAL: the marker exists from the click,
+  -- the text arrives with S_EVENT_MARK_CHANGE.
+  if not event.text or not event.pos then return reject("no text or position yet") end
 
   -- Skip our own markers (see FEEDBACK-LOOP HAZARD above).
-  if event.idx and event.idx >= DWGR.MarkIdBase then return end
+  --
+  -- Ownership is an EXPLICIT REGISTRY, not an id range. DCS's marker-id counter
+  -- is global and monotonic across every mark on the map, script-created marks
+  -- included - so once HandleImpact had drawn a marker at 90001, DCS handed out
+  -- ids above 90000 to PLAYER marks too. The old "idx >= MarkIdBase means ours"
+  -- test then silently swallowed every FAC request made after the first M156
+  -- impact.
+  if event.idx and DWGR.OwnMarks[event.idx] then
+    return reject("script-created marker")
+  end
 
-  -- Bare keyword: trim, upper-case, and require an exact match. The extra
-  -- parentheses drop gsub's second return value.
-  local keyword = string.upper((string.gsub(event.text, "^%s*(.-)%s*$", "%1")))
+  -- Bare keyword: trim, upper-case, and require an exact match. tostring guards
+  -- a non-string text field; the extra parentheses drop gsub's second return.
+  local keyword = string.upper((string.gsub(tostring(event.text), "^%s*(.-)%s*$", "%1")))
   local build   = DWGR.MarkRequestTypes[keyword]
-  if not build then return end   -- an ordinary map note: ignore silently
+  if not build then
+    return reject("'" .. keyword .. "' is not a mission keyword")
+  end
 
   -- One mission per marker. ADDED and CHANGE can both carry the keyword, and
   -- CHANGE fires again on every later edit of the same marker; without this a
   -- FAC retyping a mark would stack duplicate missions on the wing.
-  if event.idx and DWGR.HandledMarks[event.idx] then return end
+  if event.idx and DWGR.HandledMarks[event.idx] then
+    return reject("marker already tasked a mission")
+  end
 
-  -- Who placed it? initiator is nil for marks placed from a non-unit slot.
+  -- Who placed it? DCS is inconsistent here: mark events sometimes carry an
+  -- initiator unit and sometimes only a groupID, so try the cheap path first
+  -- and fall back to resolving the id. Either can legitimately be absent (a
+  -- mark placed from a spectator slot has no group at all).
   local groupName
   if event.initiator then
     pcall(function()
@@ -1146,10 +1184,23 @@ function DWGR.HandleMarkEvent(event)
     end)
   end
 
+  if not groupName and event.groupID then
+    pcall(function()
+      for _, side in pairs({ coalition.side.BLUE, coalition.side.RED }) do
+        for _, grp in pairs(coalition.getGroups(side) or {}) do
+          if grp:getID() == event.groupID then
+            groupName = grp:getName()
+            return
+          end
+        end
+      end
+    end)
+  end
+
   if DWGR.MarkRequestFACOnly then
     if not groupName or not string.find(groupName, DWGR.FACNamePattern) then
-      DWGR.Log(string.format("%s mark ignored - not placed by a '%s' group.",
-          keyword, DWGR.FACNamePattern), 10)
+      DWGR.Log(string.format("%s mark ignored - placed by '%s', not a '%s' group.",
+          keyword, groupName or "unknown", DWGR.FACNamePattern), 10)
       return
     end
   end
