@@ -102,6 +102,8 @@ DWGR.SmokeRefresh           = 290      -- s between re-issues; must be < SmokeLi
 DWGR.MarkRequestEnabled     = true
 DWGR.MarkDebug              = true     -- log WHY a mark was rejected (log only, no on-screen spam)
 DWGR.MarkDumpEvents         = false    -- dump the raw mark event table; see DWGR.DumpMarkEvent
+DWGR.MarkRemoveOnComplete   = true     -- delete the requesting marker when its mission ends,
+                                       -- so the F10 map shows only OUTSTANDING requests
 
 -- WHO MAY TASK A MISSION FROM THE MAP.
 --
@@ -1327,12 +1329,38 @@ function DWGR.HandleMarkEvent(event)
   DWGR.MarkMissionCount = DWGR.MarkMissionCount + 1
   mission:SetName(string.format("FAC %s %d", keyword, DWGR.MarkMissionCount))
 
-  -- Send the flight home when the mission resolves, matching the CAS path.
+  -- Send the flight home when the mission resolves, matching the CAS path, and
+  -- clear the requesting marker off the F10 map so it does not outlive the
+  -- mission it tasked.
+  --
+  -- Capture the idx rather than the event: this closure outlives the handler by
+  -- the whole length of the mission, and there is no reason to pin the event
+  -- table (and its DCS object references) open for that long.
+  local markIdx  = event.idx
+  local released = false
+
   local function release(reason)
+    -- Success and Done can BOTH fire for one mission; the flights only need
+    -- sending home once, and removeMark on an already-removed id is pointless.
+    if released then return end
+    released = true
+
     local grps = mission:GetOpsGroups()
     if grps then
       for _, fg in pairs(grps) do
         DWGR.SendHome(fg, reason)
+      end
+    end
+
+    if DWGR.MarkRemoveOnComplete and markIdx then
+      DWGR.RemoveMark(markIdx)
+      -- Drop the dedup entry too. S_EVENT_MARK_REMOVED would normally clear it,
+      -- but that is not guaranteed to fire for a script-removed mark, and a
+      -- stale entry would block a future marker if DCS ever reissued the id.
+      DWGR.HandledMarks[markIdx] = nil
+      if DWGR.MarkDebug then
+        env.info(string.format("DWGR: removed request marker idx=%s (%s).",
+            tostring(markIdx), reason))
       end
     end
   end
