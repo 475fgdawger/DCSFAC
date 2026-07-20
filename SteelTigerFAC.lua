@@ -101,6 +101,7 @@ DWGR.SmokeRefresh           = 290      -- s between re-issues; must be < SmokeLi
 -- REQUESTS section below for the keyword list and the safety filters.
 DWGR.MarkRequestEnabled     = true
 DWGR.MarkDebug              = true     -- log WHY a mark was rejected (log only, no on-screen spam)
+DWGR.MarkDumpEvents         = false    -- dump the raw mark event table; see DWGR.DumpMarkEvent
 
 -- WHO MAY TASK A MISSION FROM THE MAP.
 --
@@ -1147,15 +1148,24 @@ end
 
 
 -- ---------------------------------------------------------------------------
--- Dump every field a mark event actually carries.
+-- Dump every field a mark event actually carries. OFF by default
+-- (DWGR.MarkDumpEvents): this diagnosed the placer-identification problem and
+-- is kept only for the next time DCS changes the event shape under us.
 --
--- DCS's documented shape for these events does not match what it delivers in
--- practice, and which of initiator / groupID / coalition is populated varies.
--- Rather than keep guessing, this prints the real table so the placer filter
--- can be written against observed behaviour.
+-- Observed on DCS as of 2026-07, for a player mark on the coalition channel:
+--
+--   coalition=2  idx=251658241  time=23419  id=26  text=SEAD
+--   groupID=-1   pos=table      (NO initiator field at all)
+--
+-- Three things that shape the code above follow from that line:
+--   * idx is ~251 million, so a marker id range can NEVER identify our own
+--     marks - hence the explicit DWGR.OwnMarks registry.
+--   * id=26 is S_EVENT_MARK_CHANGE: the text arrives on CHANGE, not ADDED.
+--   * groupID=-1 and no initiator: the placer is anonymous and cannot be
+--     matched by name.
 -- ---------------------------------------------------------------------------
 function DWGR.DumpMarkEvent(event)
-  if not DWGR.MarkDebug then return end
+  if not DWGR.MarkDumpEvents then return end
 
   local parts = {}
   pcall(function()
