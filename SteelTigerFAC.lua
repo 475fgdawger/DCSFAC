@@ -107,6 +107,13 @@ DWGR.MarkRemoveOnComplete   = true     -- delete the requesting marker when its 
 DWGR.MarkAcknowledge        = true     -- on tasking, replace "SEAD" with "SEAD Mission Tasked"
 DWGR.MarkAckSuffix          = " Mission Tasked"
 
+-- A mission the airwing never recruits for sits in the queue indefinitely and
+-- never reaches Success/Done, so its marker would never clear and the FAC would
+-- be left watching a request that is not coming. Expire it instead: cancel the
+-- mission and post a short-lived "No SEAD available" marker in its place.
+DWGR.MarkRecruitTimeout     = 120      -- s to wait for the wing to recruit before giving up
+DWGR.MarkFailedLifetime     = 60       -- s the "No <type> available" marker stays up
+
 -- WHO MAY TASK A MISSION FROM THE MAP.
 --
 -- DCS does NOT identify who placed a coalition-channel mark: the event carries
@@ -1343,6 +1350,7 @@ function DWGR.HandleMarkEvent(event)
   -- completion removes the acknowledgement rather than an id that is already
   -- gone. release() reads it as an upvalue, so it sees the updated value.
   local markIdx  = event.idx
+  local markPos  = event.pos    -- plain Vec3; safe to hold, unlike the event table
   local released = false
 
   local function release(reason)
@@ -1364,6 +1372,7 @@ function DWGR.HandleMarkEvent(event)
       -- but that is not guaranteed to fire for a script-removed mark, and a
       -- stale entry would block a future marker if DCS ever reissued the id.
       DWGR.HandledMarks[markIdx] = nil
+      DWGR.OwnMarks[markIdx]     = nil   -- the acknowledgement, if there was one
       if DWGR.MarkDebug then
         env.info(string.format("DWGR: removed request marker idx=%s (%s).",
             tostring(markIdx), reason))
@@ -1392,7 +1401,7 @@ function DWGR.HandleMarkEvent(event)
   -- request. (The acknowledged text would not match a bare keyword anyway, but
   -- relying on that would make the safety depend on the wording.)
   local acknowledged = false
-  if DWGR.MarkAcknowledge and event.idx and event.pos then
+  if DWGR.MarkAcknowledge and event.idx and markPos then
     pcall(function()
       DWGR.RemoveMark(event.idx)
       DWGR.HandledMarks[event.idx] = nil   -- the original id no longer exists
@@ -1403,7 +1412,7 @@ function DWGR.HandleMarkEvent(event)
 
       -- readOnly = true: the acknowledgement is script-owned and is cleared
       -- when the mission ends, so players cannot delete it out from under us.
-      trigger.action.markToAll(ackId, keyword .. DWGR.MarkAckSuffix, event.pos, true)
+      trigger.action.markToAll(ackId, keyword .. DWGR.MarkAckSuffix, markPos, true)
 
       markIdx      = ackId   -- completion now clears the acknowledgement
       acknowledged = true
@@ -1415,6 +1424,57 @@ function DWGR.HandleMarkEvent(event)
   -- same marker and try again rather than being locked out of that idx.
   if not acknowledged and event.idx then
     DWGR.HandledMarks[event.idx] = true
+  end
+
+  -- ---------------------------------------------------------------------
+  -- Expire the request if the wing never recruits for it.
+  --
+  -- A mission with no asset to fly it stays QUEUED forever: it never reaches
+  -- Success or Done, so nothing ever clears its marker and the FAC is left
+  -- watching a request that is not coming. WingHasPayloadFor catches the case
+  -- where no payload EXISTS, but not the case where every jet that could fly
+  -- it is already busy, out of range, or off duty.
+  -- ---------------------------------------------------------------------
+  if DWGR.MarkRecruitTimeout and DWGR.MarkRecruitTimeout > 0 then
+    timer.scheduleFunction(function()
+      pcall(function()
+        -- Recruited, finished, or already cancelled: nothing to expire.
+        if not (mission:IsPlanned() or mission:IsQueued()) then return end
+
+        -- Claim the release latch BEFORE cancelling. Cancel drives the mission
+        -- to Done, which would otherwise call release() and delete the failure
+        -- marker this branch is about to post.
+        released = true
+
+        DWGR.RemoveMark(markIdx)
+        if markIdx then DWGR.HandledMarks[markIdx] = nil end
+
+        -- Post the failure notice, and clear it on its own timer so the map
+        -- does not keep a permanent record of a request that went nowhere.
+        if markPos then
+          DWGR.MarkIdCounter = (DWGR.MarkIdCounter or DWGR.MarkIdBase) + 1
+          local failId = DWGR.MarkIdCounter
+          DWGR.OwnMarks[failId] = true
+
+          trigger.action.markToAll(failId,
+              string.format("No %s available", keyword), markPos, true)
+
+          timer.scheduleFunction(function()
+            pcall(function()
+              DWGR.RemoveMark(failId)
+              DWGR.OwnMarks[failId] = nil
+            end)
+            return nil
+          end, nil, timer.getTime() + DWGR.MarkFailedLifetime)
+        end
+
+        mission:Cancel()
+
+        DWGR.Log(string.format("%s expired - no asset recruited in %ds.",
+            mission:GetName(), DWGR.MarkRecruitTimeout), 20)
+      end)
+      return nil
+    end, nil, timer.getTime() + DWGR.MarkRecruitTimeout)
   end
 
   DWGR.Log(string.format("%s tasked from map mark by %s: %s (%s).",
