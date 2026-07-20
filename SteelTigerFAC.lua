@@ -100,8 +100,25 @@ DWGR.SmokeRefresh           = 290      -- s between re-issues; must be < SmokeLi
 -- keywords and the airwing is tasked at that point. See the MAP-MARK MISSION
 -- REQUESTS section below for the keyword list and the safety filters.
 DWGR.MarkRequestEnabled     = true
-DWGR.MarkRequestFACOnly     = true     -- only marks from a FAC-named group task missions
 DWGR.MarkDebug              = true     -- log WHY a mark was rejected (log only, no on-screen spam)
+
+-- WHO MAY TASK A MISSION FROM THE MAP.
+--
+-- DCS does NOT identify who placed a coalition-channel mark: the event carries
+-- coalition=2 and groupID=-1, with no initiator field at all. So "only a FAC
+-- may task missions" cannot be enforced by name for ordinary map marks.
+--
+-- What IS enforceable, and what these two settings do:
+--   MarkRequestFACOnly   - when DCS DOES identify the placer (marks addressed
+--                          to a specific group carry a real groupID), require
+--                          the group name to contain DWGR.FACNamePattern.
+--   MarkRequestNeedsFAC  - when the placer is ANONYMOUS, accept the request
+--                          only while a live blue FAC exists in the mission.
+--                          This is the rule that actually applies in practice.
+--                          Set false to let any blue player task at will.
+-- The blue-coalition gate is always enforced regardless of both.
+DWGR.MarkRequestFACOnly     = true
+DWGR.MarkRequestNeedsFAC    = true
 DWGR.EnemyCoalition         = coalition.side.RED
 
 -- Search radii, metres; the mark is the centre of the search.
@@ -950,8 +967,14 @@ end
 --
 -- WHY BARE KEYWORDS ARE SAFE:
 --   The text must equal a keyword EXACTLY once trimmed and upper-cased, so an
---   ordinary map note ("SEAD site?") is inert. Marks are additionally required
---   to come from a FAC group (DWGR.MarkRequestFACOnly).
+--   ordinary map note ("SEAD site?") is inert.
+--
+-- WHO MAY TASK - AND WHY IT IS NOT A NAME CHECK:
+--   DCS does not say who placed a coalition-channel mark. The observed event
+--   is: coalition=2, groupID=-1, NO initiator field. So the placer is
+--   anonymous and cannot be matched against DWGR.FACNamePattern. Requests are
+--   instead gated on the blue coalition plus a live FAC in the mission; see
+--   DWGR.MarkRequestNeedsFAC in the configuration block.
 --
 -- WHICH EVENT - THIS MATTERS:
 --   DCS creates the marker the instant the player CLICKS the map, before any
@@ -1254,12 +1277,22 @@ function DWGR.HandleMarkEvent(event)
     return reject("mark is not on the blue coalition channel")
   end
 
-  if DWGR.MarkRequestFACOnly then
-    if not groupName or not string.find(groupName, DWGR.FACNamePattern) then
+  -- Authorisation splits on whether DCS identified the placer at all.
+  if groupName then
+    -- Identified: hold it to the FAC name rule.
+    if DWGR.MarkRequestFACOnly and not string.find(groupName, DWGR.FACNamePattern) then
+      DWGR.Log(string.format("%s mark ignored - placed by '%s', not a '%s' group.",
+          keyword, groupName, DWGR.FACNamePattern), 10)
+      return
+    end
+  else
+    -- Anonymous, which is the normal case for a coalition-channel mark. The
+    -- best available proxy is that a FAC is on station; DWGR.AnyFACAlive is
+    -- the same check the stack backfill uses.
+    if DWGR.MarkRequestNeedsFAC and not DWGR.AnyFACAlive() then
       DWGR.Log(string.format(
-          "%s mark ignored - placed by '%s', not a '%s' group. "
-          .. "(Set DWGR.MarkRequestFACOnly=false to allow any blue player.)",
-          keyword, groupName or "unknown", DWGR.FACNamePattern), 10)
+          "%s mark ignored - no live '%s' group in the mission.",
+          keyword, DWGR.FACNamePattern), 10)
       return
     end
   end
